@@ -86,6 +86,7 @@ class KoreaStockSelector:
         momentum_weight: float = 0.6,
         momentum_filter_enabled: bool = False,
         large_cap_min_mcap: float | None = None,
+        sector_max_stocks: int | None = None,
         cache_dir: str = "results/cache",
         timing_enabled: bool = True,
         fundamental_cache_format: str = "parquet",
@@ -103,6 +104,7 @@ class KoreaStockSelector:
         self.momentum_weight = momentum_weight
         self.momentum_filter_enabled = momentum_filter_enabled
         self.large_cap_min_mcap = large_cap_min_mcap
+        self.sector_max_stocks = sector_max_stocks
         self.cache_dir = cache_dir
         self.timing_enabled = timing_enabled
         self.fundamental_cache_format = fundamental_cache_format
@@ -1341,33 +1343,41 @@ class KoreaStockSelector:
     def _get_industry_info(self, tickers, date_str):
         try:
             industry_map = {}
-            cache_hits = 0
-            cache_misses = 0
-            for ticker in set(tickers):
-                if ticker in self.industry_cache:
-                    industry_map[ticker] = self.industry_cache[ticker]
-                    cache_hits += 1
-                    continue
-                try:
-                    info = stock.get_market_ticker_info(ticker)
-                    if info:
-                        industry = info.get("업종", "기타")
-                        industry_map[ticker] = industry
-                        self.industry_cache[ticker] = industry
-                    else:
-                        industry_map[ticker] = "기타"
-                        self.industry_cache[ticker] = "기타"
-                    cache_misses += 1
-                except Exception:
-                    industry_map[ticker] = "기타"
-                    self.industry_cache[ticker] = "기타"
-                    cache_misses += 1
+            # 캐시 미스 종목만 추려냄
+            missing = [t for t in set(tickers) if t not in self.industry_cache]
+            cache_hits = len(set(tickers)) - len(missing)
 
+            if missing:
+                # 배치 조회: 업종분류현황().fetch() 직접 호출 (per-ticker API 함수 없음)
+                for mkt_code in ["STK", "KSQ"]:
+                    try:
+                        from pykrx.website.krx.market.wrap import 업종분류현황
+                        raw = 업종분류현황().fetch(date_str, mkt_code)
+                        if raw is not None and not raw.empty:
+                            code_col = next((c for c in ["ISU_SRT_CD"] if c in raw.columns), None)
+                            name_col = next((c for c in ["IDX_IND_NM"] if c in raw.columns), None)
+                            if code_col and name_col:
+                                for _, row in raw.iterrows():
+                                    ticker = str(row[code_col]).strip().zfill(6)
+                                    sector = str(row.get(name_col, "기타")).strip() or "기타"
+                                    self.industry_cache[ticker] = sector
+                    except Exception:
+                        pass
+
+                # 배치 조회 후에도 미스인 종목은 "기타"로 채움
+                for ticker in missing:
+                    if ticker not in self.industry_cache:
+                        self.industry_cache[ticker] = "기타"
+
+            for ticker in tickers:
+                industry_map[ticker] = self.industry_cache.get(ticker, "기타")
+
+            cache_miss = len(missing)
             if self.timing_enabled:
-                print(f"    [CACHE] industry hit={cache_hits}, miss={cache_misses}")
+                print(f"    [CACHE] industry hit={cache_hits}, miss={cache_miss}")
             return industry_map
         except Exception:
-            return {}
+            return {t: "기타" for t in tickers}
 
     def _pick_dividend_column(self, df):
         if "DIV" in df.columns:
@@ -1657,6 +1667,24 @@ class KoreaStockSelector:
             df.loc[:, "total_rank"] = (1.0 - m) * df["rank_greenblatt_pct"] + m * df["rank_mom_pct"]
 
             df_sorted = df.sort_values("total_rank", ascending=True)
+
+            # 섹터 분산 제한: 동일 업종 최대 sector_max_stocks 종목까지만 허용
+            if self.sector_max_stocks and self.sector_max_stocks > 0:
+                industry_map = self._get_industry_info(df_sorted["ticker"].tolist(), date_str)
+                df_sorted = df_sorted.copy()
+                df_sorted["industry"] = df_sorted["ticker"].map(industry_map).fillna("기타")
+                sector_counts: dict[str, int] = {}
+                picked_indices = []
+                for idx, row in df_sorted.iterrows():
+                    sec = row["industry"]
+                    cnt = sector_counts.get(sec, 0)
+                    if cnt < self.sector_max_stocks:
+                        picked_indices.append(idx)
+                        sector_counts[sec] = cnt + 1
+                    if len(picked_indices) >= self.num_stocks:
+                        break
+                df_sorted = df_sorted.loc[picked_indices]
+                print(f"      [SECTOR] max_per_sector={self.sector_max_stocks}, 선정: {len(df_sorted)}개")
 
             if self.kosdaq_target_ratio is not None:
                 kosdaq_target = int(self.num_stocks * self.kosdaq_target_ratio)

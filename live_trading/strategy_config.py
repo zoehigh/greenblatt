@@ -29,6 +29,10 @@ class StrategyConfig:
     momentum_weight: float = 0.60
     momentum_filter_enabled: bool = True
     large_cap_min_mcap: float | None = None
+    sector_max_stocks: int | None = None
+    market_timing_enabled: bool = False
+    market_timing_ma_days: int = 200
+    market_timing_cash_ratio: float = 1.0
     fundamental_source: str = "pykrx"
     # --- 비용 ---
     commission_fee_rate: float = 0.00015
@@ -180,6 +184,12 @@ class BacktestConfig(StrategyConfig):
                 )
             ).lower() in {"1", "true", "yes", "y"},
             large_cap_min_mcap=float(lcap_env) if lcap_env else None,
+            sector_max_stocks=int(env_get("SECTOR_MAX_STOCKS", default="0")) or None,
+            market_timing_enabled=str(
+                env_get("MARKET_TIMING_ENABLED", default="false")
+            ).lower() in {"1", "true", "yes", "y"},
+            market_timing_ma_days=int(env_get("MARKET_TIMING_MA_DAYS", default="200")),
+            market_timing_cash_ratio=float(env_get("MARKET_TIMING_CASH_RATIO", default="1.0")),
             fundamental_source=env_get(
                 "FUNDAMENTAL_SOURCE",
                 fallback_keys=["BACKTEST_FUNDAMENTAL_SOURCE", "LIVE_FUNDAMENTAL_SOURCE"],

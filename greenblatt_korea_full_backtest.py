@@ -28,6 +28,7 @@ import argparse
 from defaults import DEFAULT_REBALANCE_MONTHS
 from utils.env import env_get
 from vol_targeting import compute_vol_target_ratio
+from market_timing import check_market_timing
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -252,7 +253,16 @@ class KoreaStockBacktest:
             self.large_cap_min_mcap = float(env_lcap) if env_lcap else None
         else:
             self.large_cap_min_mcap = large_cap_min_mcap
-            
+
+        # 섹터 분산 제한: 동일 섹터 최대 N종목 (0 또는 None이면 비활성)
+        sector_max_env = env_get('SECTOR_MAX_STOCKS', default='0')
+        self.sector_max_stocks: int | None = int(sector_max_env) or None
+
+        # 마켓 타이밍: KOSPI MA 기반 약세장 회피
+        self.market_timing_enabled = str(env_get('MARKET_TIMING_ENABLED', default='false')).lower() in {'1', 'true', 'yes', 'y'}
+        self.market_timing_ma_days = int(env_get('MARKET_TIMING_MA_DAYS', default='200'))
+        self.market_timing_cash_ratio = float(env_get('MARKET_TIMING_CASH_RATIO', default='1.0'))
+
         self.fundamental_source = str(fundamental_source or env_get('FUNDAMENTAL_SOURCE', fallback_keys=['BACKTEST_FUNDAMENTAL_SOURCE', 'LIVE_FUNDAMENTAL_SOURCE'], default='pykrx')).strip().lower()
         
         self.capital_constrained_selection_enabled = bool(capital_constrained_selection_enabled)
@@ -341,6 +351,7 @@ class KoreaStockBacktest:
             momentum_weight=self.momentum_weight,
             momentum_filter_enabled=self.momentum_filter_enabled,
             large_cap_min_mcap=self.large_cap_min_mcap,
+            sector_max_stocks=self.sector_max_stocks,
             fundamental_source=self.fundamental_source,
             cache_dir=self.cache_dir,
             timing_enabled=self.timing_enabled,
@@ -1407,6 +1418,10 @@ class KoreaStockBacktest:
 
             if self.capital_constrained_selection_enabled:
                 holdings_map = {ticker: int(pos.get('shares', 0)) for ticker, pos in self.portfolio.items()}
+                holding_prices_map = {
+                    ticker: float(pos.get('current_price', pos.get('buy_price', 0.0)))
+                    for ticker, pos in self.portfolio.items()
+                }
                 selected_stocks, alloc_meta = select_capital_constrained_stocks(
                     selected=selected_stocks,
                     holdings=holdings_map,
@@ -1416,6 +1431,8 @@ class KoreaStockBacktest:
                     max_stocks=self.capital_constrained_max_stocks,
                     min_stocks=self.capital_constrained_min_stocks,
                     slippage_rate=self.slippage_rate,
+                    holding_prices=holding_prices_map,
+                    existing_positions_policy='sell',
                 )
                 print(
                     "  [ALLOC] 자본제약 적용: "
@@ -1529,6 +1546,24 @@ class KoreaStockBacktest:
                     f"base={vol_decision.base_ratio:.4f} → effective={vol_decision.effective_ratio:.4f}"
                 )
             effective_investment_ratio = vol_decision.effective_ratio
+
+            # 마켓 타이밍: KOSPI MA 기반 약세장 회피 (vol-target 이후 적용)
+            mt_decision = check_market_timing(
+                date_str=selection_date_fmt,
+                enabled=self.market_timing_enabled,
+                ma_days=self.market_timing_ma_days,
+                cash_ratio_when_bearish=self.market_timing_cash_ratio,
+            )
+            if self.market_timing_enabled:
+                print(
+                    f"  [MARKET-TIMING] reason={mt_decision.reason}, "
+                    f"KOSPI={f'{mt_decision.kospi_close:,.0f}' if mt_decision.kospi_close else 'N/A'}, "
+                    f"MA{mt_decision.ma_days}={f'{mt_decision.ma_value:,.0f}' if mt_decision.ma_value else 'N/A'}, "
+                    f"in_market={mt_decision.in_market}"
+                )
+            if not mt_decision.in_market:
+                print(f"  [MARKET-TIMING] 약세장 감지 → 투자비율 {effective_investment_ratio:.4f} × {mt_decision.investment_ratio_multiplier:.2f} = {effective_investment_ratio * mt_decision.investment_ratio_multiplier:.4f}")
+            effective_investment_ratio = effective_investment_ratio * mt_decision.investment_ratio_multiplier
 
             # 리밸런싱
             t_exec_start = time.perf_counter()

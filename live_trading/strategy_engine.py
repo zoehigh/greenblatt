@@ -25,6 +25,7 @@ class LiveSignalEngine:
             momentum_weight=strategy_config.momentum_weight,
             momentum_filter_enabled=strategy_config.momentum_filter_enabled,
             large_cap_min_mcap=strategy_config.large_cap_min_mcap,
+            sector_max_stocks=strategy_config.sector_max_stocks,
             fundamental_source=strategy_config.fundamental_source,
         )
 

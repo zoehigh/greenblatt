@@ -141,6 +141,7 @@ class LiveTradingConfig(StrategyConfig):
             rebalance_months_val = int(str(DEFAULT_REBALANCE_MONTHS))
 
         lcap_env = env_get("LARGE_CAP_MIN_MCAP", fallback_keys=["LIVE_LARGE_CAP_MIN_MCAP"], default="")
+        sector_max_env = env_get("SECTOR_MAX_STOCKS", fallback_keys=["LIVE_SECTOR_MAX_STOCKS"], default="0")
 
         return cls(
             # StrategyConfig 공통 필드
@@ -156,6 +157,10 @@ class LiveTradingConfig(StrategyConfig):
             momentum_weight=float(env_get("MOMENTUM_WEIGHT", fallback_keys=["LIVE_MOMENTUM_WEIGHT"], default="0.60")),
             momentum_filter_enabled=str(env_get("MOMENTUM_FILTER_ENABLED", fallback_keys=["LIVE_MOMENTUM_FILTER_ENABLED"], default="true")).lower() in {"1", "true", "yes", "y"},
             large_cap_min_mcap=float(lcap_env) if lcap_env else None,
+            sector_max_stocks=int(sector_max_env) or None,
+            market_timing_enabled=str(env_get("MARKET_TIMING_ENABLED", fallback_keys=["LIVE_MARKET_TIMING_ENABLED"], default="false")).lower() in {"1", "true", "yes", "y"},
+            market_timing_ma_days=int(env_get("MARKET_TIMING_MA_DAYS", fallback_keys=["LIVE_MARKET_TIMING_MA_DAYS"], default="200")),
+            market_timing_cash_ratio=float(env_get("MARKET_TIMING_CASH_RATIO", fallback_keys=["LIVE_MARKET_TIMING_CASH_RATIO"], default="1.0")),
             fundamental_source=env_get("FUNDAMENTAL_SOURCE", fallback_keys=["LIVE_FUNDAMENTAL_SOURCE"], default="pykrx").strip().lower(),
             commission_fee_rate=float(env_get("COMMISSION_FEE_RATE", fallback_keys=["LIVE_COMMISSION_FEE_RATE"], default="0.0015")),
             tax_rate=float(env_get("TAX_RATE", fallback_keys=["LIVE_TAX_RATE"], default="0.002")),

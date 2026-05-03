@@ -403,6 +403,59 @@ def _save_daily_report(config: LiveTradingConfig, trading_date: str, report_rows
     print(f"일일 체결 리포트 저장: {path}")
 
 
+def _save_rebalance_snapshot(
+    config: LiveTradingConfig,
+    trading_date: str,
+    selected: pd.DataFrame,
+    holdings: dict[str, int],
+    cash: float,
+    effective_investment_ratio: float,
+    vol_multiplier: float | None = None,
+    mt_in_market: bool | None = None,
+    mt_reason: str | None = None,
+) -> None:
+    """리밸런싱 시점의 포트폴리오 스냅샷, 선정 종목, 타이밍 결정을 저장한다.
+
+    results/live_reports/snapshot_{yyyymmdd}.json 으로 저장.
+    이후 성과 분석 및 실전 vs 백테스트 비교에 활용한다.
+    """
+    if not config.save_daily_report:
+        return
+
+    os.makedirs(config.report_dir, exist_ok=True)
+    yyyymmdd = trading_date.replace("-", "")
+    snap_path = os.path.join(config.report_dir, f"snapshot_{yyyymmdd}.json")
+
+    snapshot_data: dict[str, Any] = {
+        "trading_date": trading_date,
+        "timestamp": _kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cash": cash,
+        "effective_investment_ratio": effective_investment_ratio,
+        "vol_target_multiplier": vol_multiplier,
+        "market_timing_in_market": mt_in_market,
+        "market_timing_reason": mt_reason,
+        "holdings": [
+            {"ticker": t, "quantity": q} for t, q in sorted(holdings.items())
+        ],
+        "selected_stocks": (
+            selected[["ticker", "name", "close", "score"]].to_dict(orient="records")
+            if not selected.empty and all(c in selected.columns for c in ["ticker", "name", "close", "score"])
+            else selected.to_dict(orient="records") if not selected.empty
+            else []
+        ),
+    }
+
+    with open(snap_path, "w", encoding="utf-8") as f:
+        json.dump(snapshot_data, f, ensure_ascii=False, indent=2)
+    print(f"리밸런싱 스냅샷 저장: {snap_path}")
+
+    # 선정 종목 별도 CSV (분석 편의)
+    if not selected.empty:
+        sel_path = os.path.join(config.report_dir, f"selected_{yyyymmdd}.csv")
+        selected.to_csv(sel_path, index=False, encoding="utf-8-sig")
+        print(f"선정 종목 CSV 저장: {sel_path}")
+
+
 def _month_index(dt: datetime) -> int:
     return dt.year * 12 + (dt.month - 1)
 
@@ -728,6 +781,9 @@ async def run_once(signal_date: str | None = None, *, force: bool = False, dry_r
 
             # 변동성 타게팅: 일별 리포트(fills)에서 포트폴리오 가치 히스토리를 구성해 유효 투자비율 계산
             effective_investment_ratio = config.investment_ratio
+            _vol_multiplier: float | None = None
+            _mt_in_market: bool | None = None
+            _mt_reason: str | None = None
             if config.vol_target_enabled:
                 try:
                     port_history = _build_portfolio_history_from_reports(config.report_dir)
@@ -770,6 +826,7 @@ async def run_once(signal_date: str | None = None, *, force: bool = False, dry_r
                         min_ratio=config.vol_target_min_ratio,
                     )
                     effective_investment_ratio = vol_decision.effective_ratio
+                    _vol_multiplier = vol_decision.multiplier
                     print(
                         f"[VOL-TARGET] reason={vol_decision.reason}, "
                         f"σ_realized={f'{vol_decision.sigma_realized*100:.1f}%' if vol_decision.sigma_realized is not None else 'N/A'}, "
@@ -779,6 +836,29 @@ async def run_once(signal_date: str | None = None, *, force: bool = False, dry_r
                     )
                 except Exception as _vol_err:
                     print(f"[VOL-TARGET] 계산 실패, base_ratio 유지: {_vol_err}")
+
+            # 마켓 타이밍: KOSPI 200일 MA 기반 약세장 감지 시 투자비율 축소
+            if config.market_timing_enabled:
+                from market_timing import check_market_timing
+                mt_decision = check_market_timing(
+                    date_str=signal.trading_date,
+                    enabled=config.market_timing_enabled,
+                    ma_days=config.market_timing_ma_days,
+                    cash_ratio_when_bearish=config.market_timing_cash_ratio,
+                )
+                print(
+                    f"[MARKET-TIMING] reason={mt_decision.reason}, "
+                    f"in_market={mt_decision.in_market}, "
+                    f"multiplier={mt_decision.investment_ratio_multiplier:.2f}"
+                )
+                effective_investment_ratio = effective_investment_ratio * mt_decision.investment_ratio_multiplier
+                _mt_in_market = mt_decision.in_market
+                _mt_reason = mt_decision.reason
+                if not mt_decision.in_market:
+                    print(
+                        f"[MARKET-TIMING] 약세장 감지 → "
+                        f"투자비율 → {effective_investment_ratio:.4f}"
+                    )
 
             if config.debug_signal_enabled:
                 _print_selected_debug(signal.selected, max(1, config.debug_max_rows))
@@ -814,6 +894,19 @@ async def run_once(signal_date: str | None = None, *, force: bool = False, dry_r
                 commission_fee_rate=config.commission_fee_rate,
                 existing_positions_policy=config.existing_positions_policy,
                 holding_prices=snapshot.holding_prices,
+            )
+
+            # 리밸런싱 시점 스냅샷 저장 (성과 분석·백테스트 비교용)
+            _save_rebalance_snapshot(
+                config=config,
+                trading_date=signal.trading_date,
+                selected=selected_for_order,
+                holdings=snapshot.holdings,
+                cash=snapshot.cash,
+                effective_investment_ratio=effective_investment_ratio,
+                vol_multiplier=_vol_multiplier,
+                mt_in_market=_mt_in_market,
+                mt_reason=_mt_reason,
             )
 
             if config.debug_signal_enabled:

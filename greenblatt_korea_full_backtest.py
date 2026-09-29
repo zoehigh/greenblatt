@@ -56,6 +56,11 @@ from live_trading.strategy_config import BacktestConfig
 from live_trading.execution import select_capital_constrained_stocks
 
 
+# 일별 수익률 산정에서 제외할 date gap 임계값(일). 이보다 큰 간격의 수익률은
+# 결측 구간/비영업일이 연속 거래처럼 변동성을 부풀리는 착시를 방지하기 위해 제외한다.
+_GAP_EXCLUSION_DAYS = 4
+
+
 class KoreaStockBacktest:
     """한국 주식 그린블라트 응용 전략 백테스트"""
     
@@ -81,7 +86,8 @@ class KoreaStockBacktest:
                  vol_target_sigma: float = None,
                  vol_target_lookback: int = None,
                  vol_target_min_ratio: float = None,
-                 use_open_price: bool = None):
+                 use_open_price: bool = None,
+                 data_unavailable_policy: str = None):
         """
         Parameters:
         -----------
@@ -327,6 +333,21 @@ class KoreaStockBacktest:
         else:
             self.use_open_price = bool(use_open_price)
 
+        # 8-1. 데이터 조회 실패 정책: strict(기본) / hold_and_mark(진단용)
+        if data_unavailable_policy is None:
+            self.data_unavailable_policy = env_get(
+                'DATA_UNAVAILABLE_POLICY',
+                fallback_keys=['BACKTEST_DATA_UNAVAILABLE_POLICY'],
+                default='strict',
+            ).strip().lower()
+        else:
+            self.data_unavailable_policy = str(data_unavailable_policy).strip().lower()
+        if self.data_unavailable_policy not in {'strict', 'hold_and_mark'}:
+            raise ValueError(
+                f"data_unavailable_policy는 'strict' 또는 'hold_and_mark'여야 합니다 "
+                f"(받은 값: {self.data_unavailable_policy!r})"
+            )
+
         self.industry_cache = {}
         self.momentum_cache = {}
         self.price_cache = {}
@@ -394,6 +415,7 @@ class KoreaStockBacktest:
             vol_target_lookback=config.vol_target_lookback,
             vol_target_min_ratio=config.vol_target_min_ratio,
             use_open_price=config.use_open_price,
+            data_unavailable_policy=config.data_unavailable_policy,
             cache_dir=config.cache_dir,
             timing_enabled=config.timing_enabled,
             fundamental_cache_format=config.fundamental_cache_format,
@@ -1191,12 +1213,23 @@ class KoreaStockBacktest:
             # effective_date(T-1)로 기록하면 T-1→T-1+1→T 순서로 가짜 수익률이 생겨
             # σ_realized 가 60~100%로 부풀려 볼타게팅이 항상 65% 투자로 제한된다.
             record_date = execution_date_fmt
-            portfolio_value = self.get_portfolio_value()
 
             if screen_status == ScreenStatus.DATA_UNAVAILABLE:
                 self._data_missing_dates.append(record_date)
+                if self.data_unavailable_policy == 'strict':
+                    print("=" * 80)
+                    print(f"⚠ 데이터 조회 실패: {record_date} 리밸런싱 건너뜀(보유 유지)")
+                    print("=" * 80)
+                    # strict(기본) 정책: 첫 DATA_UNAVAILABLE 발생 즉시 중단.
+                    # 보유 유지로 이어지는 결측 구간이 성과 지표에 섞이지 않도록 한다.
+                    raise RuntimeError(
+                        f"DATA_UNAVAILABLE (strict): {record_date} — 리밸런싱 데이터 조회 실패 "
+                        f"(selector status={screen_status.value!r}). "
+                        "거짓 성과 지표를 생성하지 않습니다. "
+                        "data_unavailable_policy='hold_and_mark'로 설정하면 보유 유지 마크로 계속할 수 있습니다."
+                    )
                 print("=" * 80)
-                print(f"⚠ 데이터 조회 실패: {record_date} 리밸런싱 건너뜀(보유 유지)")
+                print(f"⚠ 데이터 조회 실패: {record_date} 리밸런싱 건너뜀(보유 유지) [hold_and_mark]")
                 print("=" * 80)
             elif screen_status == ScreenStatus.NO_ELIGIBLE_STOCKS:
                 # NOTE: 선정 불가(또는 자본제약으로 매수 불가) 시 리밸런싱뿐 아니라 손실매도
@@ -1204,52 +1237,88 @@ class KoreaStockBacktest:
                 #       내리는 대신 보유 유지가 보수적으로 안전하다는 트레이드오프를 따른다.
                 print("  선정 종목이 없습니다. 보유 유지 (리밸런싱/손실매도/변동성타게팅 건너뜀)")
 
-            # OK-path 리밸런싱 직후 스냅샷이 같은 날짜의 기존(일별) 기록보다 늦게 쌓이므로
-            # calculate_performance의 drop_duplicates(keep='last')가 최신 스냅샷을 유지한다.
-            recorded_dates.add(record_date)
-            self.portfolio_history.append({
-                'date': record_date,
-                'portfolio_value': portfolio_value,
-                'cash': self.cash,
-                'stock_value': portfolio_value - self.cash,
-                'num_holdings': len(self.portfolio),
-                'return': (portfolio_value - self.initial_capital) / self.initial_capital
-            })
-            
-            print(f"  포트폴리오 가치: {portfolio_value:,.0f}원 ({(portfolio_value/self.initial_capital-1)*100:.2f}%)")
+            # 일별 루프용 가격 조회 (hold_and_mark는 DATA_UNAVAILABLE 분기에서 단일 fetch 재사용;
+            # _fetch_period_close_prices는 price_cache만 쓰고 읽지 않으므로 중복 API 호출이 없다)
+            next_boundary = rebalance_dates[i + 1] if i + 1 < len(rebalance_dates) else self.end_date
+            tickers_held = list(self.portfolio.keys())
+            shares_map = {t: self.portfolio[t]['shares'] for t in tickers_held}
+            fallback_prices = {t: self.portfolio[t].get('current_price', 0.0) for t in tickers_held}
+            prices_df = self._fetch_period_close_prices(tickers_held, record_date, next_boundary)
+
+            # 마크 기록: hold_and_mark는 execution-date MTM 마크(fresh closes)를 사용하고,
+            # 그 외(OK/NO_ELIGIBLE)는 리밸런싱 직후 스냅샷을 그대로 사용한다.
+            if screen_status == ScreenStatus.DATA_UNAVAILABLE:
+                if prices_df.empty:
+                    # total OHLCV 실패 → stale/flat-fill 마크 금지 (fail-fast)
+                    raise RuntimeError(
+                        f"DATA_UNAVAILABLE (hold_and_mark): {record_date} — 보유 종목 OHLCV 조회가 "
+                        f"전체 실패했습니다 (tickers={tickers_held}). flat-fill 마크를 생성하지 않습니다."
+                    )
+                first_row = prices_df.iloc[0]
+                uncovered = [
+                    t for t in tickers_held
+                    if t not in prices_df.columns or pd.isna(first_row.get(t))
+                ]
+                if uncovered:
+                    print(f"  [MARK] ⚠ 마크일 가격 미조회(부분 실패), current_price fallback: {uncovered}")
+                stock_val = sum(
+                    shares_map.get(t, 0) * (
+                        float(first_row[t]) if t in first_row.index and not pd.isna(first_row[t])
+                        else fallback_prices.get(t, 0.0)
+                    )
+                    for t in tickers_held
+                )
+                mark_value = self.cash + stock_val
+                recorded_dates.add(record_date)
+                self.portfolio_history.append({
+                    'date': record_date,
+                    'portfolio_value': mark_value,
+                    'cash': self.cash,
+                    'stock_value': stock_val,
+                    'num_holdings': len(self.portfolio),
+                    'return': (mark_value - self.initial_capital) / self.initial_capital
+                })
+                print(f"  포트폴리오 가치: {mark_value:,.0f}원 ({(mark_value/self.initial_capital-1)*100:.2f}%)")
+            else:
+                portfolio_value = self.get_portfolio_value()
+                # OK-path 리밸런싱 직후 스냅샷이 같은 날짜의 기존(일별) 기록보다 늦게 쌓이므로
+                # calculate_performance의 drop_duplicates(keep='last')가 최신 스냅샷을 유지한다.
+                recorded_dates.add(record_date)
+                self.portfolio_history.append({
+                    'date': record_date,
+                    'portfolio_value': portfolio_value,
+                    'cash': self.cash,
+                    'stock_value': portfolio_value - self.cash,
+                    'num_holdings': len(self.portfolio),
+                    'return': (portfolio_value - self.initial_capital) / self.initial_capital
+                })
+                print(f"  포트폴리오 가치: {portfolio_value:,.0f}원 ({(portfolio_value/self.initial_capital-1)*100:.2f}%)")
 
             # 리밸런싱 구간 내 일별 포트폴리오 가치 기록 (MDD 계산 정확도 향상)
             # 일별 모니터링도 실제 매수일(record_date)부터 시작해 가짜 pre-purchase 데이터를 제거한다.
-            # DATA_UNAVAILABLE 상태에서는 일별 가격 데이터가 없으므로 스킵한다.
-            if screen_status != ScreenStatus.DATA_UNAVAILABLE and len(self.portfolio) > 0:
-                next_boundary = rebalance_dates[i + 1] if i + 1 < len(rebalance_dates) else self.end_date
-                tickers_held = list(self.portfolio.keys())
-                shares_map = {t: self.portfolio[t]['shares'] for t in tickers_held}
-                fallback_prices = {t: self.portfolio[t].get('current_price', 0.0) for t in tickers_held}
-
-                prices_df = self._fetch_period_close_prices(tickers_held, record_date, next_boundary)
-                if not prices_df.empty:
-                    for dt_idx, row in prices_df.iterrows():
-                        date_str = dt_idx.strftime('%Y-%m-%d') if hasattr(dt_idx, 'strftime') else str(dt_idx)[:10]
-                        if date_str in recorded_dates:
-                            continue
-                        recorded_dates.add(date_str)
-                        stock_val = sum(
-                            shares_map.get(t, 0) * (
-                                float(row[t]) if t in row.index and not pd.isna(row[t])
-                                else fallback_prices.get(t, 0.0)
-                            )
-                            for t in tickers_held
+            # 첫 행(record_date 마크)은 recorded_dates 가드로 스킵된다.
+            if len(self.portfolio) > 0 and not prices_df.empty:
+                for dt_idx, row in prices_df.iterrows():
+                    date_str = dt_idx.strftime('%Y-%m-%d') if hasattr(dt_idx, 'strftime') else str(dt_idx)[:10]
+                    if date_str in recorded_dates:
+                        continue
+                    recorded_dates.add(date_str)
+                    stock_val = sum(
+                        shares_map.get(t, 0) * (
+                            float(row[t]) if t in row.index and not pd.isna(row[t])
+                            else fallback_prices.get(t, 0.0)
                         )
-                        total_val = self.cash + stock_val
-                        self.portfolio_history.append({
-                            'date': date_str,
-                            'portfolio_value': total_val,
-                            'cash': self.cash,
-                            'stock_value': stock_val,
-                            'num_holdings': len(self.portfolio),
-                            'return': (total_val - self.initial_capital) / self.initial_capital
-                        })
+                        for t in tickers_held
+                    )
+                    total_val = self.cash + stock_val
+                    self.portfolio_history.append({
+                        'date': date_str,
+                        'portfolio_value': total_val,
+                        'cash': self.cash,
+                        'stock_value': stock_val,
+                        'num_holdings': len(self.portfolio),
+                        'return': (total_val - self.initial_capital) / self.initial_capital
+                    })
 
             self._log_timing('rebalance.total', time.perf_counter() - t_rebal_start)
 
@@ -1292,8 +1361,9 @@ class KoreaStockBacktest:
             self.selector.persist_caches()
             self._log_timing('backtest.total', time.perf_counter() - total_start)
         
-        # Fail-fast 가드: 시도한 모든 리밸런싱이 데이터 조회 실패(DATA_UNAVAILABLE)였다면
+        # Fail-fast 가드 (hold_and_mark 백스톱): 시도한 모든 리밸런싱이 DATA_UNAVAILABLE였다면
         # 거짓 성과 지표를 반환하는 대신 명시적으로 오류를 발생시킨다.
+        # (strict 모드는 루프에서 첫 발생 시 즉시 raise하므로 여기까지 도달하지 않는다)
         if len(rebalance_dates) > 0 and len(self._data_missing_dates) >= len(rebalance_dates):
             raise RuntimeError(
                 "모든 리밸런싱 시도가 데이터 조회 실패(DATA_UNAVAILABLE) 상태였습니다: "
@@ -1337,9 +1407,15 @@ class KoreaStockBacktest:
 
         # 샤프 비율 (연환산, 무위험수익률 3.5%)
         # 공식: (CAGR - Rf) / (일별 변동성 × √252)
+        # gap-spanning 수익률(date gap > 4일)은 일별 변동성 산정에서 제외 —
+        # 결측 구간(데이터 부재/비영업일)이 연속 수익률처럼 변동성을 부풀리는 착시를 방지한다.
         _rf = 0.035
-        _daily_rets = df.set_index('date')['portfolio_value'].pct_change().dropna()
-        _annual_vol = _daily_rets.std() * np.sqrt(252)
+        _vol_series = df.set_index('date')['portfolio_value']
+        _daily_rets = _vol_series.pct_change().dropna()
+        _gap_days = _vol_series.index.to_series().diff().dt.days
+        _gap_days = _gap_days.loc[_daily_rets.index]
+        _daily_rets = _daily_rets[_gap_days <= _GAP_EXCLUSION_DAYS]
+        _annual_vol = _daily_rets.std() * np.sqrt(252) if len(_daily_rets) > 1 else 0.0
         sharpe = (cagr - _rf) / _annual_vol if _annual_vol > 0 else 0
 
         results = {
@@ -1358,6 +1434,9 @@ class KoreaStockBacktest:
             'num_trades': len(self.trade_history),
             'data_missing_dates': list(self._data_missing_dates),
             'num_data_missing_days': len(self._data_missing_dates),
+            # strict 실행은 첫 실패 시 즉시 raise되므로 여기 도달하는 degraded는
+            # hold_and_mark 실행 중 실패일이 하나 이상 있었던 경우뿐이다.
+            'degraded': self.data_unavailable_policy == 'hold_and_mark' and len(self._data_missing_dates) > 0,
             'portfolio_df': df,
             'trades_df': pd.DataFrame(self.trade_history)
         }
@@ -1387,11 +1466,13 @@ class KoreaStockBacktest:
         print(f"총 거래 횟수:  {results['num_trades']:>15}회")
         print("="*80)
         
-        # 데이터 조회 실패 경고 (리밸런싱이 건너뛰어진 일수)
+        # 데이터 조회 실패 경고 (리밸런싱이 건너뛰어진 일수; strict 모드는 첫 실패 시 즉시
+        # raise하므로 이 경고가 출력되는 경우는 hold_and_mark(degraded) 실행뿐이다)
         if results.get('num_data_missing_days', 0) > 0:
             print("\n" + "="*80)
-            print(f"⚠ 데이터 조회 실패일: {results['num_data_missing_days']}일 — 해당 리밸런싱을 건너뛰고 보유를 유지했습니다.")
+            print(f"⚠ [DEGRADED] 데이터 조회 실패일: {results['num_data_missing_days']}일 — 해당 리밸런싱은 보유 유지 마크로 기록됨 (hold_and_mark)")
             print(f"  실패일: {', '.join(results.get('data_missing_dates', []))}")
+            print("  ⚠ 결과 지표는 결측 구간을 보유 유지로 가정한 진단용 수치입니다. 샤프/변동성은 gap-exclusion 적용 후 산출됩니다.")
             print("="*80)
         
         # 연도별 수익률 (전년 말 포트폴리오 가치 대비 해당 연도 수익률)

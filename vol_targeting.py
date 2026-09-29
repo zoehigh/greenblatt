@@ -19,6 +19,12 @@ import numpy as np
 import pandas as pd
 
 
+# 일별 수익률 산정에서 제외할 date gap 임계값(일). 결측 구간(데이터 부재, 리밸런싱
+# 건너뜀)이 연속 거래처럼 변동성을 부풀리는 착시를 방지하기 위해 이보다 큰 간격의
+# 수익률은 실현 변동성 계산에서 제외한다.
+_GAP_EXCLUSION_DAYS = 4
+
+
 @dataclass(slots=True)
 class VolTargetDecision:
     enabled: bool
@@ -93,9 +99,9 @@ def compute_vol_target_ratio(
 
     # 최근 lookback_days 기간의 일별 수익률
     recent = portfolio_history[-(safe_lookback + 1):]
-    values = [r["portfolio_value"] for r in recent if r.get("portfolio_value") is not None]
+    rows = [r for r in recent if r.get("portfolio_value") is not None]
 
-    if len(values) < safe_lookback + 1:
+    if len(rows) < safe_lookback + 1:
         return VolTargetDecision(
             enabled=True,
             base_ratio=safe_base,
@@ -104,12 +110,44 @@ def compute_vol_target_ratio(
             sigma_realized=None,
             multiplier=1.0,
             lookback_days=safe_lookback,
-            data_points=len(values),
+            data_points=len(rows),
             reason="insufficient_history",
         )
 
+    values = [r["portfolio_value"] for r in rows]
     arr = np.array(values, dtype=float)
     daily_returns = arr[1:] / arr[:-1] - 1.0
+
+    # gap-spanning 수익률(date gap > 4일)은 일별 변동성 산정에서 제외한다.
+    # 백테스트/실전 히스토리의 결측 구간(데이터 부재, 리밸런싱 건너뜀)이 연속 거래처럼
+    # 변동성을 부풀리는 착시를 방지한다. 날짜 필드가 없거나 파싱 불가하면 기존 방식대로
+    # 계산한다 (defense-in-depth, fail-open).
+    dates = [r.get("date") for r in rows]
+    if all(dates):
+        try:
+            gap_days = np.array(
+                [
+                    (pd.Timestamp(b) - pd.Timestamp(a)).days
+                    for a, b in zip(dates[:-1], dates[1:])
+                ]
+            )
+            daily_returns = daily_returns[gap_days <= _GAP_EXCLUSION_DAYS]
+        except Exception:
+            pass
+
+    if len(daily_returns) == 0:
+        return VolTargetDecision(
+            enabled=True,
+            base_ratio=safe_base,
+            effective_ratio=safe_base,
+            sigma_target=safe_sigma_target,
+            sigma_realized=None,
+            multiplier=1.0,
+            lookback_days=safe_lookback,
+            data_points=len(values) - 1,
+            reason="insufficient_history",
+        )
+
     sigma_daily = float(np.std(daily_returns, ddof=1))
     sigma_realized = sigma_daily * np.sqrt(252)  # 연환산
 
@@ -122,7 +160,7 @@ def compute_vol_target_ratio(
             sigma_realized=float(sigma_realized),
             multiplier=1.0,
             lookback_days=safe_lookback,
-            data_points=len(values) - 1,
+            data_points=len(daily_returns),
             reason="zero_volatility",
         )
 
@@ -140,7 +178,7 @@ def compute_vol_target_ratio(
         sigma_realized=float(sigma_realized),
         multiplier=float(multiplier),
         lookback_days=safe_lookback,
-        data_points=len(values) - 1,
+        data_points=len(daily_returns),
         reason="ok",
     )
 

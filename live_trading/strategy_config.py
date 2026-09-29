@@ -59,6 +59,9 @@ class BacktestConfig(StrategyConfig):
     fundamental_cache_format: str = "parquet"
     fundamental_cache_max_entries: int = 16
     use_open_price: bool = False
+    # 데이터 조회 실패 시 정책: 'strict'(기본, 첫 실패 즉시 중단) / 'hold_and_mark'(진단용, 보유 유지 마크).
+    # BacktestConfig 전용 — live-trading 브리지(StrategyConfig)는 이 정책을 사용하지 않는다.
+    data_unavailable_policy: str = "strict"
 
     @classmethod
     def from_env(cls) -> "BacktestConfig":
@@ -127,6 +130,18 @@ class BacktestConfig(StrategyConfig):
             "LARGE_CAP_MIN_MCAP",
             fallback_keys=["BACKTEST_LARGE_CAP_MIN_MCAP", "LIVE_LARGE_CAP_MIN_MCAP"],
         )
+
+        # data_unavailable_policy 파싱 + 검증 (BacktestConfig 전용)
+        data_unavailable_policy = env_get(
+            "DATA_UNAVAILABLE_POLICY",
+            fallback_keys=["BACKTEST_DATA_UNAVAILABLE_POLICY"],
+            default="strict",
+        ).strip().lower()
+        if data_unavailable_policy not in {"strict", "hold_and_mark"}:
+            raise ValueError(
+                f"DATA_UNAVAILABLE_POLICY는 'strict' 또는 'hold_and_mark'여야 합니다 "
+                f"(받은 값: {data_unavailable_policy!r})"
+            )
 
         return cls(
             # StrategyConfig 공통 필드
@@ -278,4 +293,5 @@ class BacktestConfig(StrategyConfig):
             use_open_price=str(
                 env_get("USE_OPEN_PRICE", fallback_keys=["BACKTEST_USE_OPEN_PRICE"], default="false")
             ).lower() in {"1", "true", "yes", "y"},
+            data_unavailable_policy=data_unavailable_policy,
         )

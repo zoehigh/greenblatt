@@ -10,7 +10,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=1.26.4,<=2.0",
     "pandas>=2.2.0,<3.0",
-    "pykrx>=1.2.4",
+    "pykrx>=1.2.8",
     "python-dotenv>=1.0.0",
     "yfinance>=1.2.0",
 ]

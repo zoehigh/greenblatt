@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import asyncio
 
+from enum import Enum
+
 KIWOOM_AVAILABLE = False
 
 PYKRX_SESSION_ENABLED = False
@@ -69,6 +71,18 @@ try:
     requests.sessions.Session.request = _session_request_with_timeout
 except Exception:
     pass
+
+
+class ScreenStatus(str, Enum):
+    """스크리닝 결과 상태 — 백테스트가 데이터 부재/선정 불가를 구분해 처리한다.
+
+    - OK: 정상적으로 종목이 선정됨 (또는 선정 대상 자체가 존재)
+    - NO_ELIGIBLE_STOCKS: 스크리닝은 수행됐으나 필터 후 선정 가능 종목이 없음
+    - DATA_UNAVAILABLE: 펀더멘탈/가격 데이터를 조회할 수 없음 (라이브러리 부재, 빈 응답, 예외)
+    """
+    OK = "ok"
+    NO_ELIGIBLE_STOCKS = "no_eligible_stocks"
+    DATA_UNAVAILABLE = "data_unavailable"
 
 
 class KoreaStockSelector:
@@ -128,6 +142,7 @@ class KoreaStockSelector:
         self.fundamental_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
 
         self._load_caches()
+        self.last_screen_status = ScreenStatus.OK
 
     def _should_try_kiwoom_fundamental(self, normalized_date: str) -> bool:
         if self.fundamental_source == "pykrx":
@@ -1378,7 +1393,7 @@ class KoreaStockSelector:
 
     def screen_stocks_pykrx_roe(self, target_date, markets=["KOSPI", "KOSDAQ"]):
         if not LIBRARIES_AVAILABLE:
-            return pd.DataFrame()
+            return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
         try:
             date_str = target_date.replace("-", "")
@@ -1386,7 +1401,7 @@ class KoreaStockSelector:
 
             if df.empty:
                 print("    ROE 스크리닝: 펀더멘탈 데이터 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
             industry_map = self._get_industry_info(df["ticker"].tolist(), date_str)
             df["industry"] = df["ticker"].map(industry_map).fillna("기타")
@@ -1397,7 +1412,7 @@ class KoreaStockSelector:
 
             if len(df) == 0:
                 print("    ROE 스크리닝: 필터링 후 종목 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), ScreenStatus.NO_ELIGIBLE_STOCKS
 
             df.loc[:, "ROE"] = np.where(
                 (df["EPS"] > 0) & (df["BPS"] > 0),
@@ -1427,15 +1442,16 @@ class KoreaStockSelector:
                 print(f"      PBR {result['PBR'].min():.2f}~{result['PBR'].max():.2f} (평균 {result['PBR'].mean():.2f})")
                 print(f"      ROE {result['ROE'].min():.1f}~{result['ROE'].max():.1f}% (평균 {result['ROE'].mean():.2f}%)")
 
-            return result[["ticker", "PER", "PBR", "ROE", "total_rank", "close", "market_cap"]].copy()
+            _status = ScreenStatus.OK if len(result) > 0 else ScreenStatus.NO_ELIGIBLE_STOCKS
+            return result[["ticker", "PER", "PBR", "ROE", "total_rank", "close", "market_cap"]].copy(), _status
 
         except Exception as e:
             print(f"    ROE 스크리닝 오류: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
     def screen_stocks_mixed(self, target_date, markets=["KOSPI", "KOSDAQ"]):
         if not LIBRARIES_AVAILABLE:
-            return pd.DataFrame()
+            return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
         try:
             t_screen_start = time.perf_counter()
@@ -1444,7 +1460,7 @@ class KoreaStockSelector:
 
             if df.empty:
                 print("    MIXED 스크리닝: 펀더멘탈 데이터 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
             self._log_filter_count("MIXED", "input", len(df), len(df), extra=f"profile={self.mixed_filter_profile}")
             self._log_numeric_column_stats(
@@ -1486,7 +1502,7 @@ class KoreaStockSelector:
 
             if len(df) == 0:
                 print("    MIXED 스크리닝: 품질 필터 후 종목 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), ScreenStatus.NO_ELIGIBLE_STOCKS
 
             before = len(df)
             cap_lower_limit = df["market_cap"].quantile(0.80)
@@ -1501,7 +1517,7 @@ class KoreaStockSelector:
 
             if len(df) == 0:
                 print("    MIXED 스크리닝: 시장별 분위수 필터 후 종목 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), ScreenStatus.NO_ELIGIBLE_STOCKS
 
             t_ranking_start = time.perf_counter()
             try:
@@ -1697,13 +1713,19 @@ class KoreaStockSelector:
 
             self._log_timing("mixed.total", time.perf_counter() - t_screen_start)
 
-            return result[["ticker", "market", "PER", "PBR", "ROE", "DIV_YIELD", "total_rank", "close", "market_cap"]].copy()
+            _status = ScreenStatus.OK if len(result) > 0 else ScreenStatus.NO_ELIGIBLE_STOCKS
+            return result[["ticker", "market", "PER", "PBR", "ROE", "DIV_YIELD", "total_rank", "close", "market_cap"]].copy(), _status
 
         except Exception as e:
             print(f"    MIXED 스크리닝 오류: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), ScreenStatus.DATA_UNAVAILABLE
 
     def select_stocks(self, trading_date: str) -> pd.DataFrame:
         if self.strategy_mode == "mixed":
-            return self.screen_stocks_mixed(trading_date)
-        return self.screen_stocks_pykrx_roe(trading_date)
+            df, status = self.screen_stocks_mixed(trading_date)
+        else:
+            df, status = self.screen_stocks_pykrx_roe(trading_date)
+        # 스크리닝 상태 기록 (백테스트가 데이터 부재/선정 불가를 구분할 수 있게 함)
+        self.last_screen_status = status
+        # 공개 계약은 그대로: bare DataFrame 반환 (live_trading 브리지/테스트는 변경 없음)
+        return df

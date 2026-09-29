@@ -51,7 +51,7 @@ except ImportError:
     print("경고: FinanceDataReader 또는 pykrx가 설치되지 않았습니다.")
     print("설치 명령: uv sync")
 
-from stock_selector import KoreaStockSelector
+from stock_selector import KoreaStockSelector, ScreenStatus
 from live_trading.strategy_config import BacktestConfig
 from live_trading.execution import select_capital_constrained_stocks
 
@@ -288,6 +288,7 @@ class KoreaStockBacktest:
         self.portfolio = {}
         self.cash = self.initial_capital
         self.portfolio_history = []
+        self._data_missing_dates: list[str] = []
         self.trade_history = []
 
         # 7. 슬리피지 및 변동성 타겟팅
@@ -1097,7 +1098,9 @@ class KoreaStockBacktest:
                 if target_shares < current_shares:
                     sell_shares = current_shares - target_shares
                     sell_price = position.get('current_price', position['buy_price'])
-                    gross_sell_amount = sell_shares * sell_price
+                    # 슬리피지 반영 실행가 (판매자는 실수령액이 소폭 감소함)
+                    exec_sell_price = sell_price * (1 - self.slippage_rate)
+                    gross_sell_amount = sell_shares * exec_sell_price
                     commission = gross_sell_amount * commission_rate
                     tax = gross_sell_amount * tax_rate
                     total_costs = commission + tax
@@ -1111,6 +1114,7 @@ class KoreaStockBacktest:
                         'action': 'SELL',
                         'shares': sell_shares,
                         'price': sell_price,
+                        'exec_price': exec_sell_price,
                         'amount': net_sell_amount,
                         'gross_amount': gross_sell_amount,
                         'commission': commission,
@@ -1381,6 +1385,10 @@ class KoreaStockBacktest:
                 current_date = current_date + pd.DateOffset(months=self.rebalance_months)
         
         # 백테스트 실행
+        # 기록일 중복 방지용 전역 집합 (리밸런싱/일별 루프/최종평가 공용, boundary double-record 방지)
+        recorded_dates: set = set()
+        # 인스턴스 재사용 시 이전 실행의 결측 기록이 fail-fast에 오염되지 않도록 초기화
+        self._data_missing_dates.clear()
         for i, rebal_date in enumerate(rebalance_dates):
             t_rebal_start = time.perf_counter()
             scheduled_date = rebal_date
@@ -1401,11 +1409,17 @@ class KoreaStockBacktest:
             self._log_timing('rebalance.select_stocks', time.perf_counter() - t_select_start)
             effective_date = execution_date_fmt
 
-            if selected_stocks.empty:
-                print("  선정 종목이 없습니다.")
-                continue
+            # 스크리닝 상태 확인 (ScreenStatus): 데이터 부재(DATA_UNAVAILABLE)와 선정 불가
+            # (NO_ELIGIBLE_STOCKS)를 구분한다. 구형 selector/테스트 더미에는 속성이
+            # 없으므로 OK로 간주한다.
+            screen_status = getattr(self.selector, 'last_screen_status', ScreenStatus.OK)
+            # OK로 간주됐으나 df가 비어 있으면(테스트 더미 등) NO_ELIGIBLE로 흡수 —
+            # OK 경로는 'ticker'/'close' 컬럼을 가정하므로 KeyError 방지.
+            if screen_status == ScreenStatus.OK and selected_stocks.empty:
+                screen_status = ScreenStatus.NO_ELIGIBLE_STOCKS
 
-            if self.capital_constrained_selection_enabled:
+            # OK 경로에서 자본제약 선택으로 매수 가능 종목이 없어지면 NO_ELIGIBLE로 하위 흡수
+            if screen_status == ScreenStatus.OK and self.capital_constrained_selection_enabled:
                 holdings_map = {ticker: int(pos.get('shares', 0)) for ticker, pos in self.portfolio.items()}
                 selected_stocks, alloc_meta = select_capital_constrained_stocks(
                     selected=selected_stocks,
@@ -1426,122 +1440,140 @@ class KoreaStockBacktest:
                 )
                 if selected_stocks.empty:
                     print("  자본 제약으로 매수 가능한 종목이 없습니다.")
-                    continue
+                    # NOTE: 자본제약으로 매수 불가 → 아래 NO_ELIGIBLE 경로(보유 유지)로 처리
+                    screen_status = ScreenStatus.NO_ELIGIBLE_STOCKS
 
-            print(f"  선정 종목: {len(selected_stocks)}개")
+            # --- OK 경로 (정상 리밸런싱): 체결가 결정 + 손실매도 + 변동성타게팅 + 재조정 ---
+            if screen_status == ScreenStatus.OK:
+                print(f"  선정 종목: {len(selected_stocks)}개")
 
-            # 체결가 결정: T-1 종가 기준 fallback 맵 구성
-            selected_tickers = selected_stocks['ticker'].tolist()
-            portfolio_tickers = list(self.portfolio.keys()) if i > 0 else []
-            fallback_close: dict = selected_stocks.set_index('ticker')['close'].to_dict()
-            for pt in portfolio_tickers:
-                if pt not in fallback_close:
-                    fallback_close[pt] = self.portfolio[pt].get(
-                        'current_price', self.portfolio[pt].get('buy_price', 0.0)
+                # 체결가 결정: T-1 종가 기준 fallback 맵 구성
+                selected_tickers = selected_stocks['ticker'].tolist()
+                portfolio_tickers = list(self.portfolio.keys()) if i > 0 else []
+                fallback_close: dict = selected_stocks.set_index('ticker')['close'].to_dict()
+                for pt in portfolio_tickers:
+                    if pt not in fallback_close:
+                        fallback_close[pt] = self.portfolio[pt].get(
+                            'current_price', self.portfolio[pt].get('buy_price', 0.0)
+                        )
+    
+                if self.use_open_price:
+                    # T 시가 일괄 조회: selected 종목 + 기존 보유 종목
+                    all_tickers_for_open = list(set(selected_tickers + portfolio_tickers))
+                    t_open_start = time.perf_counter()
+                    open_prices, open_fallback = self.selector.get_open_prices(
+                        all_tickers_for_open,
+                        execution_date_fmt,
+                        fallback_prices=fallback_close,
                     )
-
-            if self.use_open_price:
-                # T 시가 일괄 조회: selected 종목 + 기존 보유 종목
-                all_tickers_for_open = list(set(selected_tickers + portfolio_tickers))
-                t_open_start = time.perf_counter()
-                open_prices, open_fallback = self.selector.get_open_prices(
-                    all_tickers_for_open,
-                    execution_date_fmt,
-                    fallback_prices=fallback_close,
+                    self._log_timing('rebalance.open_prices', time.perf_counter() - t_open_start,
+                                     extra=f"tickers={len(all_tickers_for_open)}")
+                    # fallback 종목 선정/보유 구분 로그
+                    if open_fallback:
+                        selected_set = set(selected_tickers)
+                        fb_selected = [t for t in open_fallback if t in selected_set]
+                        fb_hold = [t for t in open_fallback if t not in selected_set]
+                        if fb_selected:
+                            print(f"  [OPEN] ⚠ fallback(선정종목): {len(fb_selected)} tickers={fb_selected}")
+                        if fb_hold:
+                            print(f"  [OPEN] fallback(보유종목): {len(fb_hold)} tickers={fb_hold}")
+                    # selected_stocks['close']를 T 시가로 교체
+                    selected_stocks = selected_stocks.copy()
+                    selected_stocks['close'] = selected_stocks['ticker'].map(
+                        lambda t: open_prices.get(t, fallback_close.get(t))
+                    )
+                    # 보유 종목 current_price를 T 시가로 갱신
+                    if i > 0 and len(self.portfolio) > 0:
+                        for ticker, position in self.portfolio.items():
+                            op = open_prices.get(ticker)
+                            if op and op > 0:
+                                position['current_price'] = op
+                else:
+                    # USE_OPEN_PRICE=false: T 종가로 체결 (장마감 동시호가 매칭)
+                    # 실전 15:20 동시호가 주문과 동일한 기준 — 백테스트/실전 일관성 확보
+                    all_tickers_for_close = list(set(selected_tickers + portfolio_tickers))
+                    t_close_start = time.perf_counter()
+                    close_prices, close_fallback = self.selector.get_close_prices(
+                        all_tickers_for_close,
+                        execution_date_fmt,
+                        fallback_prices=fallback_close,
+                    )
+                    self._log_timing('rebalance.close_prices', time.perf_counter() - t_close_start,
+                                     extra=f"tickers={len(all_tickers_for_close)}")
+                    # fallback 종목 선정/보유 구분 로그
+                    if close_fallback:
+                        selected_set = set(selected_tickers)
+                        fb_selected = [t for t in close_fallback if t in selected_set]
+                        fb_hold = [t for t in close_fallback if t not in selected_set]
+                        if fb_selected:
+                            print(f"  [CLOSE] ⚠ fallback(선정종목): {len(fb_selected)} tickers={fb_selected}")
+                        if fb_hold:
+                            print(f"  [CLOSE] fallback(보유종목): {len(fb_hold)} tickers={fb_hold}")
+                    # selected_stocks['close']를 T 종가로 교체
+                    selected_stocks = selected_stocks.copy()
+                    selected_stocks['close'] = selected_stocks['ticker'].map(
+                        lambda t: close_prices.get(t, fallback_close.get(t))
+                    )
+                    # 보유 종목 current_price를 T 종가로 갱신
+                    if i > 0 and len(self.portfolio) > 0:
+                        for ticker, position in self.portfolio.items():
+                            cp = close_prices.get(ticker)
+                            if cp and cp > 0:
+                                position['current_price'] = cp
+                    print(f"  [CLOSE] T 종가로 체결 (tickers={len(selected_tickers)})")
+    
+                # 손실 종목 매도 (첫 리밸런싱 제외)
+                if i > 0 and self.sell_losers_enabled:
+                    t_sell_start = time.perf_counter()
+                    self.sell_losers(effective_date)
+                    self._log_timing('rebalance.sell_losers', time.perf_counter() - t_sell_start)
+                
+                # 변동성 타게팅: 실현 변동성 기반으로 유효 투자비율 동적 조정
+                vol_decision = compute_vol_target_ratio(
+                    portfolio_history=self.portfolio_history,
+                    base_ratio=self.investment_ratio,
+                    enabled=self.vol_target_enabled,
+                    sigma_target=self.vol_target_sigma,
+                    lookback_days=self.vol_target_lookback,
+                    min_ratio=self.vol_target_min_ratio,
                 )
-                self._log_timing('rebalance.open_prices', time.perf_counter() - t_open_start,
-                                 extra=f"tickers={len(all_tickers_for_open)}")
-                # fallback 종목 선정/보유 구분 로그
-                if open_fallback:
-                    selected_set = set(selected_tickers)
-                    fb_selected = [t for t in open_fallback if t in selected_set]
-                    fb_hold = [t for t in open_fallback if t not in selected_set]
-                    if fb_selected:
-                        print(f"  [OPEN] ⚠ fallback(선정종목): {len(fb_selected)} tickers={fb_selected}")
-                    if fb_hold:
-                        print(f"  [OPEN] fallback(보유종목): {len(fb_hold)} tickers={fb_hold}")
-                # selected_stocks['close']를 T 시가로 교체
-                selected_stocks = selected_stocks.copy()
-                selected_stocks['close'] = selected_stocks['ticker'].map(
-                    lambda t: open_prices.get(t, fallback_close.get(t))
-                )
-                # 보유 종목 current_price를 T 시가로 갱신
-                if i > 0 and len(self.portfolio) > 0:
-                    for ticker, position in self.portfolio.items():
-                        op = open_prices.get(ticker)
-                        if op and op > 0:
-                            position['current_price'] = op
-            else:
-                # USE_OPEN_PRICE=false: T 종가로 체결 (장마감 동시호가 매칭)
-                # 실전 15:20 동시호가 주문과 동일한 기준 — 백테스트/실전 일관성 확보
-                all_tickers_for_close = list(set(selected_tickers + portfolio_tickers))
-                t_close_start = time.perf_counter()
-                close_prices, close_fallback = self.selector.get_close_prices(
-                    all_tickers_for_close,
-                    execution_date_fmt,
-                    fallback_prices=fallback_close,
-                )
-                self._log_timing('rebalance.close_prices', time.perf_counter() - t_close_start,
-                                 extra=f"tickers={len(all_tickers_for_close)}")
-                # fallback 종목 선정/보유 구분 로그
-                if close_fallback:
-                    selected_set = set(selected_tickers)
-                    fb_selected = [t for t in close_fallback if t in selected_set]
-                    fb_hold = [t for t in close_fallback if t not in selected_set]
-                    if fb_selected:
-                        print(f"  [CLOSE] ⚠ fallback(선정종목): {len(fb_selected)} tickers={fb_selected}")
-                    if fb_hold:
-                        print(f"  [CLOSE] fallback(보유종목): {len(fb_hold)} tickers={fb_hold}")
-                # selected_stocks['close']를 T 종가로 교체
-                selected_stocks = selected_stocks.copy()
-                selected_stocks['close'] = selected_stocks['ticker'].map(
-                    lambda t: close_prices.get(t, fallback_close.get(t))
-                )
-                # 보유 종목 current_price를 T 종가로 갱신
-                if i > 0 and len(self.portfolio) > 0:
-                    for ticker, position in self.portfolio.items():
-                        cp = close_prices.get(ticker)
-                        if cp and cp > 0:
-                            position['current_price'] = cp
-                print(f"  [CLOSE] T 종가로 체결 (tickers={len(selected_tickers)})")
-
-            # 손실 종목 매도 (첫 리밸런싱 제외)
-            if i > 0 and self.sell_losers_enabled:
-                t_sell_start = time.perf_counter()
-                self.sell_losers(effective_date)
-                self._log_timing('rebalance.sell_losers', time.perf_counter() - t_sell_start)
+                if self.vol_target_enabled:
+                    print(
+                        f"  [VOL-TARGET] reason={vol_decision.reason}, "
+                        f"σ_realized={f'{vol_decision.sigma_realized*100:.1f}%' if vol_decision.sigma_realized is not None else 'N/A'}, "
+                        f"σ_target={vol_decision.sigma_target*100:.0f}%, "
+                        f"multiplier={vol_decision.multiplier:.3f}, "
+                        f"base={vol_decision.base_ratio:.4f} → effective={vol_decision.effective_ratio:.4f}"
+                    )
+                effective_investment_ratio = vol_decision.effective_ratio
+    
+                # 리밸런싱
+                t_exec_start = time.perf_counter()
+                self.rebalance(selected_stocks, effective_date, investment_ratio=effective_investment_ratio)
+                self._log_timing('rebalance.execute', time.perf_counter() - t_exec_start)
             
-            # 변동성 타게팅: 실현 변동성 기반으로 유효 투자비율 동적 조정
-            vol_decision = compute_vol_target_ratio(
-                portfolio_history=self.portfolio_history,
-                base_ratio=self.investment_ratio,
-                enabled=self.vol_target_enabled,
-                sigma_target=self.vol_target_sigma,
-                lookback_days=self.vol_target_lookback,
-                min_ratio=self.vol_target_min_ratio,
-            )
-            if self.vol_target_enabled:
-                print(
-                    f"  [VOL-TARGET] reason={vol_decision.reason}, "
-                    f"σ_realized={f'{vol_decision.sigma_realized*100:.1f}%' if vol_decision.sigma_realized is not None else 'N/A'}, "
-                    f"σ_target={vol_decision.sigma_target*100:.0f}%, "
-                    f"multiplier={vol_decision.multiplier:.3f}, "
-                    f"base={vol_decision.base_ratio:.4f} → effective={vol_decision.effective_ratio:.4f}"
-                )
-            effective_investment_ratio = vol_decision.effective_ratio
-
-            # 리밸런싱
-            t_exec_start = time.perf_counter()
-            self.rebalance(selected_stocks, effective_date, investment_ratio=effective_investment_ratio)
-            self._log_timing('rebalance.execute', time.perf_counter() - t_exec_start)
-            
-            # 포트폴리오 가치 기록
+            # 포트폴리오 가치 기록 (상태별; OK/NO_ELIGIBLE/DATA 모두 동일 add+append 패턴)
             # T 시가/종가 체결 시 실제 체결일(execution_date)을 기준으로 기록해야
             # daily 모니터링에서 "매수 전 가격"이 섞이는 zig-zag 오류를 방지한다.
             # effective_date(T-1)로 기록하면 T-1→T-1+1→T 순서로 가짜 수익률이 생겨
             # σ_realized 가 60~100%로 부풀려 볼타게팅이 항상 65% 투자로 제한된다.
             record_date = execution_date_fmt if execution_date_fmt != effective_date else effective_date
             portfolio_value = self.get_portfolio_value()
+
+            if screen_status == ScreenStatus.DATA_UNAVAILABLE:
+                self._data_missing_dates.append(record_date)
+                print("=" * 80)
+                print(f"⚠ 데이터 조회 실패: {record_date} 리밸런싱 건너뜀(보유 유지)")
+                print("=" * 80)
+            elif screen_status == ScreenStatus.NO_ELIGIBLE_STOCKS:
+                # NOTE: 선정 불가(또는 자본제약으로 매수 불가) 시 리밸런싱뿐 아니라 손실매도
+                #       (sell_losers)/변동성타게팅까지 함께 스킵한다. 데이터 없이 매도 판단을
+                #       내리는 대신 보유 유지가 보수적으로 안전하다는 트레이드오프를 따른다.
+                print("  선정 종목이 없습니다. 보유 유지 (리밸런싱/손실매도/변동성타게팅 건너뜀)")
+
+            # OK-path 리밸런싱 직후 스냅샷이 같은 날짜의 기존(일별) 기록보다 늦게 쌓이므로
+            # calculate_performance의 drop_duplicates(keep='last')가 최신 스냅샷을 유지한다.
+            recorded_dates.add(record_date)
             self.portfolio_history.append({
                 'date': record_date,
                 'portfolio_value': portfolio_value,
@@ -1555,7 +1587,8 @@ class KoreaStockBacktest:
 
             # 리밸런싱 구간 내 일별 포트폴리오 가치 기록 (MDD 계산 정확도 향상)
             # 일별 모니터링도 실제 매수일(record_date)부터 시작해 가짜 pre-purchase 데이터를 제거한다.
-            if len(self.portfolio) > 0:
+            # DATA_UNAVAILABLE 상태에서는 일별 가격 데이터가 없으므로 스킵한다.
+            if screen_status != ScreenStatus.DATA_UNAVAILABLE and len(self.portfolio) > 0:
                 next_boundary = rebalance_dates[i + 1] if i + 1 < len(rebalance_dates) else self.end_date
                 tickers_held = list(self.portfolio.keys())
                 shares_map = {t: self.portfolio[t]['shares'] for t in tickers_held}
@@ -1563,12 +1596,11 @@ class KoreaStockBacktest:
 
                 prices_df = self._fetch_period_close_prices(tickers_held, record_date, next_boundary)
                 if not prices_df.empty:
-                    already_recorded = {record_date}
                     for dt_idx, row in prices_df.iterrows():
                         date_str = dt_idx.strftime('%Y-%m-%d') if hasattr(dt_idx, 'strftime') else str(dt_idx)[:10]
-                        if date_str in already_recorded:
+                        if date_str in recorded_dates:
                             continue
-                        already_recorded.add(date_str)
+                        recorded_dates.add(date_str)
                         stock_val = sum(
                             shares_map.get(t, 0) * (
                                 float(row[t]) if t in row.index and not pd.isna(row[t])
@@ -1613,18 +1645,28 @@ class KoreaStockBacktest:
                         pass
 
                 final_value = self.get_portfolio_value()
-                self.portfolio_history.append({
-                    'date': end_trading_date_fmt,
-                    'portfolio_value': final_value,
-                    'cash': self.cash,
-                    'stock_value': final_value - self.cash,
-                    'num_holdings': len(self.portfolio),
-                    'return': (final_value - self.initial_capital) / self.initial_capital
-                })
+                if end_trading_date_fmt not in recorded_dates:
+                    recorded_dates.add(end_trading_date_fmt)
+                    self.portfolio_history.append({
+                        'date': end_trading_date_fmt,
+                        'portfolio_value': final_value,
+                        'cash': self.cash,
+                        'stock_value': final_value - self.cash,
+                        'num_holdings': len(self.portfolio),
+                        'return': (final_value - self.initial_capital) / self.initial_capital
+                    })
 
             self.selector.persist_caches()
             self._log_timing('backtest.total', time.perf_counter() - total_start)
         
+        # Fail-fast 가드: 시도한 모든 리밸런싱이 데이터 조회 실패(DATA_UNAVAILABLE)였다면
+        # 거짓 성과 지표를 반환하는 대신 명시적으로 오류를 발생시킨다.
+        if len(rebalance_dates) > 0 and len(self._data_missing_dates) >= len(rebalance_dates):
+            raise RuntimeError(
+                "모든 리밸런싱 시도가 데이터 조회 실패(DATA_UNAVAILABLE) 상태였습니다: "
+                f"{self._data_missing_dates}. 거짓 수익률 지표를 생성하지 않습니다."
+            )
+
         return self.calculate_performance()
     
     def calculate_performance(self):
@@ -1636,6 +1678,8 @@ class KoreaStockBacktest:
         df = pd.DataFrame(self.portfolio_history)
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)  # 일별 기록 삽입 후 순서 보장
+        # 같은 날짜 중복 기록(경계/리밸런싱 재기록)은 마지막(최신, 리밸런싱 직후) 스냅샷을 유지한다.
+        df = df.drop_duplicates(subset='date', keep='last')
 
         # 수익률 계산
         final_value = df['portfolio_value'].iloc[-1]
@@ -1679,6 +1723,8 @@ class KoreaStockBacktest:
             'actual_start_date': df['date'].iloc[0].strftime('%Y-%m-%d'),
             'actual_end_date': df['date'].iloc[-1].strftime('%Y-%m-%d'),
             'num_trades': len(self.trade_history),
+            'data_missing_dates': list(self._data_missing_dates),
+            'num_data_missing_days': len(self._data_missing_dates),
             'portfolio_df': df,
             'trades_df': pd.DataFrame(self.trade_history)
         }
@@ -1707,6 +1753,13 @@ class KoreaStockBacktest:
         print(f"백테스트 기간: {results['years']:>14.2f}년")
         print(f"총 거래 횟수:  {results['num_trades']:>15}회")
         print("="*80)
+        
+        # 데이터 조회 실패 경고 (리밸런싱이 건너뛰어진 일수)
+        if results.get('num_data_missing_days', 0) > 0:
+            print("\n" + "="*80)
+            print(f"⚠ 데이터 조회 실패일: {results['num_data_missing_days']}일 — 해당 리밸런싱을 건너뛰고 보유를 유지했습니다.")
+            print(f"  실패일: {', '.join(results.get('data_missing_dates', []))}")
+            print("="*80)
         
         # 연도별 수익률 (전년 말 포트폴리오 가치 대비 해당 연도 수익률)
         df = results['portfolio_df'].copy()

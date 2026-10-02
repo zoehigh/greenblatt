@@ -121,6 +121,7 @@ VOL_TARGET_MIN_RATIO=0.30
 # - `SELL_LOSERS_HOLD_REBALANCE_CYCLES`: 리밸런스 사이클 단위로 보유 기간을 지정합니다.
 #    예: `REBALANCE_DAYS=7` + `SELL_LOSERS_HOLD_REBALANCE_CYCLES=4` → 28일.
 # 우선순위: `SELL_LOSERS_HOLD_DAYS` > `SELL_LOSERS_HOLD_REBALANCE_CYCLES` > 기본값(365일).
+# - 거래 기록(`backtest_trades.csv`의 action 구분값): `SELL_LOSS`는 보유기간 경과 후 손실 종목 손절 매도.
 
 # 펀더멘털 소스(권장 통합 키)
 FUNDAMENTAL_SOURCE=pykrx
